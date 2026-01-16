@@ -1,0 +1,20 @@
+{
+  "api_url": "http://localhost:1234/v1/chat/completions",
+  "model": "openai/gpt-oss-20b",
+
+  "db": {
+    "dialect": "postgres",
+    "host": "localhost",
+    "port": 5432,
+    "database": "appdb",
+    "user": "app",
+    "password": "app"
+  },
+
+  "embeddings_url": "http://localhost:1234/v1/embeddings",
+  "embeddings_model": "text-embedding-nomic-embed-text-v1.5",
+
+  "chroma_dir": "chroma",
+  "chroma_collection": "knowledge_base",
+  "rag_top_k": 4
+}

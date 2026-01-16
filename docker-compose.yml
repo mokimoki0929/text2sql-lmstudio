@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: t2s-postgres
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  adminer:
+    image: adminer:4
+    container_name: t2s-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: .
+    container_name: t2s-app
+    env_file:
+      - ./.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # setting.json の探索順で ENV を使いたいならこれも可
+      # CONFIG_JSON=/app/config/setting.json
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./config:/app/config:ro
+      - ./src:/app/src:ro
+    # CMD は Dockerfile のままでもOK。上書きするならここで。
+    # command: ["python", "-m", "src.run_text2sql"]
+volumes:
+  pgdata:

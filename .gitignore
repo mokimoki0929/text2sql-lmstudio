@@ -1,0 +1,19 @@
+# secrets
+.env
+*.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# logs
+*.log
+
+# chroma (RAG使うなら)
+chroma/
+*.sqlite3
+
+# docker volumes (念のため)
+pgdata/
