@@ -16,20 +16,38 @@
 ## ディレクトリ構成
 
 text2sql-lmstudio/
+
   config/
+  
     setting.json
+    
   src/
+  
     gpt_oss_local_api.py
+    
     text2sql_prompt.py        # スキーマ＋ルールを結合してプロンプト化
+    
     run_text2sql.py           # 自然文→SQL→DB実行→結果表示
+    
   db/
+  
     init/
+    
       001_schema.sql
+      
       002_seed.sql
+      
       003_seed_more.sql
+      
   docker/
+  
     postgres/
+    
       Dockerfile              # いらない
+      
   docker-compose.yml
+  
   requirements.txt
+  
   .gitignore
+  
