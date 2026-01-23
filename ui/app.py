@@ -14,12 +14,15 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+from vector_search.indexer import build_index
+from vector_search.retriever import retrieve
+
 load_dotenv()
 
 # -------------------------
 # Streamlit
 # -------------------------
-st.set_page_config(page_title="Text2SQL Chat (LM Studio / Groq)", layout="wide")
+st.set_page_config(page_title="社内チャットボット仮 (LM Studio / Groq)", layout="wide")
 
 
 # -------------------------
@@ -62,6 +65,16 @@ def get_dsn(cfg: Dict[str, Any]) -> str:
 class UiTurn:
     question: str
     summary: Optional[str] = None
+    sql: Optional[str] = None
+    cols: Optional[List[str]] = None
+    rows: Optional[List[List[Any]]] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class VectorTurn:
+    question: str
+    results: Optional[List[Dict[str, Any]]] = None
     sql: Optional[str] = None
     cols: Optional[List[str]] = None
     rows: Optional[List[List[Any]]] = None
@@ -245,9 +258,18 @@ def build_text2sql_prompt(schema_text: Optional[str], question: str) -> Tuple[st
     return system, user
 
 
-def call_text2sql(provider: str, cfg: Dict[str, Any], schema_text: Optional[str], question: str) -> str:
+def call_text2sql(
+    provider: str,
+    cfg: Dict[str, Any],
+    schema_text: Optional[str],
+    question: str,
+    history_messages: Optional[List[Dict[str, str]]] = None,
+) -> str:
     system, user = build_text2sql_prompt(schema_text, question)
-    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    msgs = [{"role": "system", "content": system}]
+    if history_messages:
+        msgs.extend(history_messages)
+    msgs.append({"role": "user", "content": user})
 
     if provider == "groq":
         out = groq_chat(msgs, temperature=0.1)
@@ -387,16 +409,293 @@ def render_result(df: pd.DataFrame) -> None:
 
 
 # -------------------------
+# Vector search visualization
+# -------------------------
+def render_vector_results(results: List[Dict[str, Any]]) -> None:
+    if not results:
+        st.info("No similar documents found.")
+        return
+    with st.expander("Vector results", expanded=False):
+        for i, item in enumerate(results, start=1):
+            source = item.get("source")
+            score = item.get("score")
+            text = item.get("text")
+            meta = json.dumps(item.get("metadata") or {}, ensure_ascii=True, default=str)
+            st.markdown(f"{i}. {source} (score={score})")
+            st.code(text or "", language="text")
+            st.caption(meta)
+
+
+def extract_hybrid_filters(
+    provider: str,
+    cfg: Dict[str, Any],
+    schema_text: Optional[str],
+    question: str,
+    history_messages: Optional[List[Dict[str, str]]] = None,
+    allowed_fields: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, Any]:
+    schema_part = schema_text or "(schema unavailable)"
+    system = (
+        "Extract search filters and a short query for hybrid search. "
+        "Return JSON only."
+    )
+    allowed_part = json.dumps(allowed_fields or {}, ensure_ascii=True)
+    user = f"""Question: {question}
+
+[Schema]
+{schema_part}
+
+Allowed fields by table (use only these):
+{allowed_part}
+
+Return JSON with keys:
+- table: string or null
+- filters: list of objects with keys field, op, value (only op "=")
+- min_score: number between 0 and 1 or null
+- query: short search query string
+"""
+    msgs = [{"role": "system", "content": system}]
+    if history_messages:
+        msgs.extend(history_messages)
+    msgs.append({"role": "user", "content": user})
+    if provider == "groq":
+        text = groq_chat(msgs, temperature=0.1)
+    else:
+        text = lmstudio_chat(cfg, msgs, temperature=0.1)
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {"table": None, "filters": [], "min_score": None, "query": question}
+
+
+def build_ui_history_messages(turns: List[UiTurn], max_turns: int = 3) -> List[Dict[str, str]]:
+    msgs: List[Dict[str, str]] = []
+    for t in turns[-max_turns:]:
+        msgs.append({"role": "user", "content": t.question})
+        parts: List[str] = []
+        if t.summary:
+            parts.append(f"summary: {t.summary[:300]}")
+        if t.sql:
+            parts.append(f"sql: {t.sql}")
+        if t.cols is not None and t.rows is not None:
+            cols = ", ".join(t.cols[:6])
+            parts.append(f"result: rows={len(t.rows)} cols={cols}")
+        if t.error:
+            parts.append(f"error: {t.error}")
+        if not parts:
+            parts.append("(no assistant output)")
+        msgs.append({"role": "assistant", "content": "\n".join(parts)})
+    return msgs
+
+
+def build_vector_history_messages(turns: List[VectorTurn], max_turns: int = 3) -> List[Dict[str, str]]:
+    msgs: List[Dict[str, str]] = []
+    for t in turns[-max_turns:]:
+        msgs.append({"role": "user", "content": t.question})
+        parts: List[str] = []
+        if t.results:
+            sources = [str(r.get("source")) for r in t.results[:3]]
+            parts.append(f"sources: {', '.join(sources)}")
+        if t.sql:
+            parts.append(f"sql: {t.sql}")
+        if t.cols is not None and t.rows is not None:
+            cols = ", ".join(t.cols[:6])
+            parts.append(f"result: rows={len(t.rows)} cols={cols}")
+        if t.error:
+            parts.append(f"error: {t.error}")
+        if not parts:
+            parts.append("(no assistant output)")
+        msgs.append({"role": "assistant", "content": "\n".join(parts)})
+    return msgs
+
+
+def fetch_allowed_fields(conn: psycopg.Connection, max_tables: int = 30) -> Dict[str, List[str]]:
+    q = """
+    SELECT table_schema, table_name, column_name
+    FROM information_schema.columns
+    WHERE table_schema NOT IN ('pg_catalog','information_schema')
+    ORDER BY table_schema, table_name, ordinal_position
+    """
+    out: Dict[str, List[str]] = {}
+    with conn.cursor() as cur:
+        cur.execute(q)
+        for schema, table, col in cur.fetchall():
+            key = f"{schema}.{table}"
+            out.setdefault(key, [])
+            if len(out[key]) < 50:
+                out[key].append(col)
+            if len(out) >= max_tables:
+                break
+    return out
+
+
+# -------------------------
 # App
 # -------------------------
 def main() -> None:
     cfg = load_setting_json()
     dsn = get_dsn(cfg)
 
-    st.title("Text2SQL Chat (LM Studio / Groq)")
+    st.title("社内チャットボット仮 (LM Studio / Groq)")
 
     if "turns" not in st.session_state:
         st.session_state["turns"] = []  # List[UiTurn]
+    if "vector_turns" not in st.session_state:
+        st.session_state["vector_turns"] = []  # List[VectorTurn]
+
+    # Sidebar: mode
+    with st.sidebar:
+        st.header("Mode")
+        mode = st.selectbox("Mode", ["text2sql", "vector_search"], index=0)
+
+    if mode == "vector_search":
+        with st.sidebar:
+            st.header("Vector Search")
+            provider = st.selectbox("LLM Provider", ["lmstudio", "groq"], index=0)
+            run_sql_answer = st.checkbox("Generate SQL answer", value=True)
+            use_hybrid = st.checkbox("Hybrid filters (LLM)", value=True)
+            show_vector_results = st.checkbox("Show vector results", value=False)
+            st.caption("Uses embeddings_url / embeddings_model from setting.json")
+            if st.button("Build / Reset Vector Index", use_container_width=True):
+                try:
+                    with psycopg.connect(dsn) as conn:
+                        count = build_index(conn, cfg, reset=True)
+                    st.success(f"Indexed {count} documents.")
+                except Exception as e:
+                    st.error(str(e))
+
+        for t in st.session_state["vector_turns"]:
+            with st.chat_message("user"):
+                st.markdown(t.question)
+            with st.chat_message("assistant"):
+                if t.error:
+                    st.error(t.error)
+                    continue
+                if t.results is not None:
+                    render_vector_results(t.results)
+                if t.sql:
+                    st.code(t.sql, language="sql")
+                if t.cols is not None and t.rows is not None:
+                    df = pd.DataFrame(t.rows, columns=t.cols)
+                    render_result(df)
+
+        question = st.chat_input("Ask a question for vector search")
+        if not question:
+            return
+
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            status = st.empty()
+            status.info("Vector search running...")
+            turn = VectorTurn(question=question)
+            try:
+                filters: Dict[str, str] | None = None
+                min_score: float | None = None
+                search_query = question
+                if use_hybrid:
+                    if "schema_text" not in st.session_state:
+                        try:
+                            with psycopg.connect(dsn) as conn:
+                                st.session_state["schema_text"] = fetch_schema_summary(conn)
+                        except Exception as e:
+                            st.session_state["schema_text"] = None
+                            st.warning(f"Schema load failed: {e}")
+                    if "allowed_fields" not in st.session_state:
+                        try:
+                            with psycopg.connect(dsn) as conn:
+                                st.session_state["allowed_fields"] = fetch_allowed_fields(conn)
+                        except Exception as e:
+                            st.session_state["allowed_fields"] = {}
+                            st.warning(f"Allowed fields load failed: {e}")
+                    info = extract_hybrid_filters(
+                        provider,
+                        cfg,
+                        st.session_state.get("schema_text"),
+                        question,
+                        history_messages=build_vector_history_messages(
+                            st.session_state["vector_turns"]
+                        ),
+                        allowed_fields=st.session_state.get("allowed_fields"),
+                    )
+                    raw_filters = info.get("filters") or []
+                    filters = {}
+                    for f in raw_filters:
+                        if not isinstance(f, dict):
+                            continue
+                        if str(f.get("op")) != "=":
+                            continue
+                        field = str(f.get("field", "")).strip()
+                        value = str(f.get("value", "")).strip()
+                        if field and value:
+                            filters[field] = value
+                    table = info.get("table")
+                    if isinstance(table, str) and table:
+                        if "." in table:
+                            table = table.split(".")[-1]
+                        filters["table"] = table
+                    filters.setdefault("type", "row")
+                    q = info.get("query")
+                    if isinstance(q, str) and q.strip():
+                        search_query = q.strip()
+                    ms = info.get("min_score")
+                    try:
+                        min_score = float(ms) if ms is not None else None
+                    except Exception:
+                        min_score = None
+                    st.caption(f"Filters: {json.dumps(filters, ensure_ascii=True)}")
+                    st.caption(f"Query: {search_query}")
+
+                with psycopg.connect(dsn) as conn:
+                    results = retrieve(
+                        conn,
+                        cfg,
+                        search_query,
+                        filters=filters,
+                        min_score=min_score,
+                    )
+                turn.results = results
+                status.empty()
+                if show_vector_results:
+                    render_vector_results(results)
+                if run_sql_answer:
+                    if "schema_text" not in st.session_state:
+                        try:
+                            with psycopg.connect(dsn) as conn:
+                                st.session_state["schema_text"] = fetch_schema_summary(conn)
+                        except Exception as e:
+                            st.session_state["schema_text"] = None
+                            st.warning(f"Schema load failed: {e}")
+
+                    sql_raw = call_text2sql(
+                        provider,
+                        cfg,
+                        st.session_state.get("schema_text"),
+                        question,
+                        history_messages=build_vector_history_messages(
+                            st.session_state["vector_turns"]
+                        ),
+                    )
+                    sql_safe = guard_sql(sql_raw, max_limit=100)
+                    turn.sql = sql_safe
+                    with psycopg.connect(dsn) as conn:
+                        cols, rows = run_query(conn, sql_safe, max_rows=300)
+                    turn.cols = cols
+                    turn.rows = [list(r) for r in rows]
+                    df = pd.DataFrame(turn.rows, columns=turn.cols)
+                    st.code(sql_safe, language="sql")
+                    render_result(df)
+            except Exception as e:
+                turn.error = str(e)
+                status.empty()
+                st.error(turn.error)
+
+        st.session_state["vector_turns"].append(turn)
+        return
 
     # schema cache
     if "schema_text" not in st.session_state:
@@ -467,7 +766,13 @@ def main() -> None:
         turn = UiTurn(question=question)
 
         try:
-            sql_raw = call_text2sql(provider, cfg, st.session_state.get("schema_text"), question)
+            sql_raw = call_text2sql(
+                provider,
+                cfg,
+                st.session_state.get("schema_text"),
+                question,
+                history_messages=build_ui_history_messages(st.session_state["turns"]),
+            )
             sql_safe = guard_sql(sql_raw, max_limit=100)
             turn.sql = sql_safe
 
